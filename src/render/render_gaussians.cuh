@@ -269,10 +269,12 @@ void kernel_render_gaussians(
 				(C >> 24) & 0xff,
 			};
 
+			float accumulatedOpacity = clamp(1.0f - remainingTranslucency, 0.0f, 1.0f);
+
 			rgba[0] = clamp(pixel.r + remainingTranslucency * oldPixel.r, 0.0f, 255.0f) ;
 			rgba[1] = clamp(pixel.g + remainingTranslucency * oldPixel.g, 0.0f, 255.0f) ;
 			rgba[2] = clamp(pixel.b + remainingTranslucency * oldPixel.b, 0.0f, 255.0f) ;
-			rgba[3] = 255;
+			rgba[3] = clamp(255.0f * accumulatedOpacity, 0.0f, 255.0f);
 
 			// if(millies > 2.0f){
 			// 	color = 0xff0000ff;

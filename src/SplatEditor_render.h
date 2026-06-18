@@ -1,4 +1,258 @@
 
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <cstdlib>
+
+#include "ImageLoader.h"
+#include "inpaint/LamaInpaint.h"
+// Temporarily disabled while maintaining only the Lama inpaint module.
+// #include "moge/MogeGsPredictor.h"
+#include "moge_gs_export.h"
+#include "json/json.hpp"
+
+static nlohmann::json dump_render_target_matrix_json(const glm::mat4& matrix){
+	nlohmann::json rows = nlohmann::json::array();
+	for(int row = 0; row < 4; row++){
+		nlohmann::json values = nlohmann::json::array();
+		for(int col = 0; col < 4; col++){
+			values.push_back(matrix[col][row]);
+		}
+		rows.push_back(values);
+	}
+	return rows;
+}
+
+static void dump_render_target_framebuffer(RenderTarget& target, string outputDirectory = "./debug"){
+
+	int width = target.width;
+	int height = target.height;
+	int64_t numPixels = int64_t(width) * int64_t(height);
+
+	if(width <= 0 || height <= 0 || target.framebuffer == nullptr){
+		println("Framebuffer dump skipped: invalid target.");
+		return;
+	}
+
+	std::filesystem::create_directories(outputDirectory);
+
+	vector<uint64_t> pixels(numPixels);
+	vector<uint8_t> rgba(numPixels * 4);
+	vector<uint8_t> opacity(numPixels);
+	vector<float> depths(numPixels);
+	vector<float> opacities(numPixels);
+
+	CURuntime::check(cuCtxSynchronize());
+	CURuntime::check(cuMemcpyDtoH(
+		pixels.data(),
+		(CUdeviceptr)target.framebuffer,
+		numPixels * sizeof(uint64_t)
+	));
+
+	float minDepth = Infinity;
+	float maxDepth = -Infinity;
+	float minOpacity = Infinity;
+	float maxOpacity = -Infinity;
+	uint64_t finiteDepthCount = 0;
+
+	for(int y = 0; y < height; y++)
+	for(int x = 0; x < width; x++)
+	{
+		int srcPixelID = x + y * width;
+		int dstPixelID = x + (height - 1 - y) * width;
+
+		uint64_t pixel = pixels[srcPixelID];
+		uint32_t color = uint32_t(pixel & 0xffffffffull);
+		uint32_t udepth = uint32_t(pixel >> 32);
+
+		float depth;
+		memcpy(&depth, &udepth, sizeof(depth));
+
+		uint8_t accumulatedOpacity = uint8_t((color >> 24) & 0xff);
+		uint8_t transparencyMask = 255 - accumulatedOpacity;
+
+		rgba[4 * dstPixelID + 0] = uint8_t((color >>  0) & 0xff);
+		rgba[4 * dstPixelID + 1] = uint8_t((color >>  8) & 0xff);
+		rgba[4 * dstPixelID + 2] = uint8_t((color >> 16) & 0xff);
+		rgba[4 * dstPixelID + 3] = accumulatedOpacity;
+		opacity[dstPixelID] = transparencyMask;
+		depths[dstPixelID] = depth;
+		opacities[dstPixelID] = float(transparencyMask) / 255.0f;
+
+		minOpacity = min(minOpacity, opacities[dstPixelID]);
+		maxOpacity = max(maxOpacity, opacities[dstPixelID]);
+
+		if(std::isfinite(depth)){
+			minDepth = min(minDepth, depth);
+			maxDepth = max(maxDepth, depth);
+			finiteDepthCount++;
+		}
+	}
+
+	static uint64_t dumpID = 0;
+	string basename = format("{}/framebuffer_{:04}", outputDirectory, dumpID++);
+	string colorPath = basename + "_color.png";
+	string opacityPath = basename + "_transparent_mask.png";
+	string opacityFloatPath = basename + "_transparent_mask.pfm";
+	string depthPath = basename + "_depth.pfm";
+	string inpaintedPath = basename + "_inpainted.png";
+	string mogePlyPath = basename + "_moge_gs.ply";
+	string infoPath = basename + "_info.txt";
+	string cameraPath = basename + "_camera.json";
+
+	stbi_write_png(colorPath.c_str(), width, height, 4, rgba.data(), width * 4);
+	stbi_write_png(opacityPath.c_str(), width, height, 1, opacity.data(), width);
+
+	{
+		std::ofstream file(opacityFloatPath, std::ios::binary);
+		file << "Pf\n" << width << " " << height << "\n-1.0\n";
+		file.write((char*)opacities.data(), opacities.size() * sizeof(float));
+	}
+
+	{
+		std::ofstream file(depthPath, std::ios::binary);
+		file << "Pf\n" << width << " " << height << "\n-1.0\n";
+		file.write((char*)depths.data(), depths.size() * sizeof(float));
+	}
+
+	{
+		glm::mat4 cameraWorld = glm::inverse(target.view);
+		glm::vec4 cameraPosition = cameraWorld * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+		float proj00 = target.proj[0][0];
+		float proj11 = target.proj[1][1];
+		float aspect = proj11 / proj00;
+		float fovyRadians = 2.0f * atan(1.0f / proj11);
+
+		nlohmann::json camera = {
+			{"width", width},
+			{"height", height},
+			{"coordinateSystem", "OpenGL camera, view space looks along -Z; depth is positive linear -view_z"},
+			{"viewMatrix", dump_render_target_matrix_json(target.view)},
+			{"projectionMatrix", dump_render_target_matrix_json(target.proj)},
+			{"viewProjectionViewportMatrix", dump_render_target_matrix_json(target.VP)},
+			{"cameraWorldMatrix", dump_render_target_matrix_json(cameraWorld)},
+			{"position", {cameraPosition.x, cameraPosition.y, cameraPosition.z}},
+			{"projection", {
+				{"proj00", proj00},
+				{"proj11", proj11},
+				{"aspect", aspect},
+				{"fovYRadians", fovyRadians},
+				{"fovYDegrees", fovyRadians * 180.0f / glm::pi<float>()},
+				{"fxPixels", 0.5f * float(width) * proj00},
+				{"fyPixels", 0.5f * float(height) * proj11},
+				{"cxPixels", 0.5f * float(width)},
+				{"cyPixels", 0.5f * float(height)}
+			}},
+			{"files", {
+				{"color", colorPath},
+				{"transparentMask", opacityPath},
+				{"transparentMaskFloat", opacityFloatPath},
+				{"depth", depthPath}
+			}}
+		};
+
+		writeFile(cameraPath.c_str(), camera.dump(4));
+	}
+
+	CUcontext splatshopCudaContext = nullptr;
+	CURuntime::check(cuCtxGetCurrent(&splatshopCudaContext));
+
+	LamaInpaintTimings inpaintTimings;
+	int inpaintExitCode = LamaInpaint::inpaintFramebuffer(colorPath, opacityPath, inpaintedPath, &inpaintTimings);
+	moge_gs::ExportResult mogeResult;
+	int mogeExitCode = -2;
+	string mogeInputPath = inpaintedPath;
+
+	if (inpaintExitCode == 0 && std::filesystem::exists(inpaintedPath)) {
+		CUcontext beforeMogeCudaContext = nullptr;
+		CURuntime::check(cuCtxGetCurrent(&beforeMogeCudaContext));
+		println("MoGe CUDA context before export: {}", uint64_t(beforeMogeCudaContext));
+
+		moge_gs::ExportConfig mogeConfig;
+		mogeConfig.mogeModelPath = std::getenv("SPLATSHOP_MOGE_CORE_MODEL")
+			? std::getenv("SPLATSHOP_MOGE_CORE_MODEL")
+			: R"(E:\projects\MoGe\workspace\moge_v1_forward_houseindoor_768_with_features_dynamic_query.onnx)";
+		mogeConfig.gsModelPath = std::getenv("SPLATSHOP_MOGE_GS_MODEL")
+			? std::getenv("SPLATSHOP_MOGE_GS_MODEL")
+			: R"(E:\projects\MoGe\workspace\gs_predictor_houseindoor_768_tokens1734.onnx)";
+		mogeConfig.imagePath = mogeInputPath;
+		mogeConfig.outputPlyPath = mogePlyPath;
+		mogeConfig.cudaDeviceId = std::getenv("SPLATSHOP_MOGE_CUDA_DEVICE")
+			? std::stoi(std::getenv("SPLATSHOP_MOGE_CUDA_DEVICE"))
+			: 0;
+		mogeConfig.resizeTo = std::getenv("SPLATSHOP_MOGE_RESIZE_TO")
+			? std::stoi(std::getenv("SPLATSHOP_MOGE_RESIZE_TO"))
+			: 768;
+		mogeConfig.warmup = 0;
+		mogeConfig.repeat = 1;
+
+		println("MoGe config:");
+		println("  mogeModelPath: {}", mogeConfig.mogeModelPath);
+		println("  gsModelPath: {}", mogeConfig.gsModelPath);
+		println("  imagePath: {}", mogeConfig.imagePath);
+		println("  outputPlyPath: {}", mogeConfig.outputPlyPath);
+		println("  resizeTo: {}", mogeConfig.resizeTo);
+		println("  cudaDeviceId: {}", mogeConfig.cudaDeviceId);
+
+		mogeResult = moge_gs::export_to_ply(mogeConfig);
+		mogeExitCode = mogeResult.exitCode;
+		CUcontext afterMogeCudaContext = nullptr;
+		CURuntime::check(cuCtxGetCurrent(&afterMogeCudaContext));
+		println("MoGe CUDA context after export: {}", uint64_t(afterMogeCudaContext));
+
+		if (mogeExitCode == 0) {
+			println("MoGe GS prediction saved: {}", mogePlyPath);
+		} else {
+			println("MoGe GS prediction failed: {}", mogeResult.message);
+		}
+	} else {
+		println("MoGe GS prediction skipped: inpainted image unavailable.");
+	}
+	// Temporarily disabled while maintaining only the Lama inpaint module.
+	// MogeGsPredictorTimings mogeTimings;
+	// int mogeExitCode = -2;
+	// string mogeInputPath = inpaintedPath;
+	// if(inpaintExitCode == 0 && std::filesystem::exists(mogeInputPath)){
+	// 	CUcontext splatshopCudaContext = nullptr;
+	// 	CURuntime::check(cuCtxGetCurrent(&splatshopCudaContext));
+	// 	mogeExitCode = MogeGsPredictor::predictToPly(mogeInputPath, mogePlyPath, &mogeTimings);
+	// 	if(splatshopCudaContext != nullptr){
+	// 		CURuntime::check(cuCtxSetCurrent(splatshopCudaContext));
+	// 		CURuntime::check(cuCtxSynchronize());
+	// 	}
+	// }else{
+	// 	println("MoGe GS prediction skipped: inpainted image unavailable.");
+	// }
+
+	if (splatshopCudaContext != nullptr) {
+		CURuntime::check(cuCtxSetCurrent(splatshopCudaContext));
+		CURuntime::check(cuCtxSynchronize());
+	}
+
+	CUcontext restoredCudaContext = nullptr;
+	CURuntime::check(cuCtxGetCurrent(&restoredCudaContext));
+	println("Framebuffer dump CUDA context before LaMa/MoGe: {}", uint64_t(splatshopCudaContext));
+	println("Framebuffer dump CUDA context after restore: {}", uint64_t(restoredCudaContext));
+
+	string info = format(
+		"width: {}\nheight: {}\nsource: virt_framebuffer->cptr\nlayout: uint64 color_low32 depth_high32\nalpha: accumulated opacity\ntransparentMask: 1.0 - accumulated opacity\ndepthConvention: positive linear -view_z in the exported camera coordinate system\nfiniteDepthCount: {}\nminDepth: {}\nmaxDepth: {}\nminTransparentMask: {}\nmaxTransparentMask: {}\ncameraPath: {}\ninpaintedPath: {}\ninpaintExitCode: {}\nlamaTotalMs: {}\nlamaModelLoadMs: {}\nlamaModelLoadedThisCall: {}\nlamaInputLoadAndPreprocessMs: {}\nlamaInferenceMs: {}\nlamaResultSaveMs: {}\n"
+		"mogeInputPath: {}\nmogePlyPath: {}\nmogeExitCode: {}\nmogeTotalMs: {}\nmogeGaussianCount: {}",
+		width, height, finiteDepthCount, minDepth, maxDepth, minOpacity, maxOpacity,
+		cameraPath, inpaintedPath, inpaintExitCode, inpaintTimings.totalMs, inpaintTimings.modelLoadMs,
+		inpaintTimings.modelLoadedThisCall, inpaintTimings.inputLoadAndPreprocessMs,
+		inpaintTimings.inferenceMs, inpaintTimings.resultSaveMs,
+		mogeInputPath,
+		mogePlyPath,
+		mogeExitCode,
+		mogeResult.timings.total_ms,
+		mogeResult.timings.gaussianCount
+	);
+	writeFile(infoPath.c_str(), info);
+
+	println("Framebuffer dump saved: {}, {}, {}, {}, {}, {}, {}", colorPath, opacityPath, opacityFloatPath, depthPath, cameraPath, inpaintedPath, infoPath);
+}
+
 void SplatEditor::render(){
 
 	cuStreamSynchronize(0);
@@ -342,6 +596,11 @@ void SplatEditor::render(){
 			auto glMapping = mapCudaGl(GLRenderer::view.framebuffer->colorAttachments[0]);
 			prog_gaussians_rendering->launch("kernel_toOpenGL", {&launchArgs, &target, &glMapping.surface}, GLRenderer::width * GLRenderer::height, mainstream);
 			glMapping.unmap();
+
+			if(settings.requestFramebufferDump){
+				dump_render_target_framebuffer(target);
+				settings.requestFramebufferDump = false;
+			}
 		}
 
 

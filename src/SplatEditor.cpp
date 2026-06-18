@@ -1790,9 +1790,16 @@ CudaGlMappings SplatEditor::mapCudaGl(shared_ptr<GLTexture> source){
 	struct RegisteredTexture{
 		GLTexture texture;
 		CUgraphicsResource resource;
+		CUcontext cudaContext = nullptr;
 	};
 
 	int64_t version = source->version;
+	CUcontext currentContext = nullptr;
+	CURuntime::check(cuCtxGetCurrent(&currentContext));
+	// println(
+	// 	"mapCudaGl begin: textureID={}, glHandle={}, version={}, currentCudaContext={}",
+	// 	source->ID, source->handle, source->version, uint64_t(currentContext)
+	// );
 	
 	static unordered_map<int64_t, RegisteredTexture> registeredResources;
 	if(registeredResources.find(source->ID) == registeredResources.end()){
@@ -1809,8 +1816,12 @@ CudaGlMappings SplatEditor::mapCudaGl(shared_ptr<GLTexture> source){
 		RegisteredTexture registration;
 		registration.texture = *source;
 		registration.resource = resource;
+		registration.cudaContext = currentContext;
 
-		println("    registered source->handle: {}, source->ID: {}, resource: {}", source->handle, source->ID, uint64_t(resource));
+		println(
+			"    registered source->handle: {}, source->ID: {}, resource: {}, cudaContext: {}",
+			source->handle, source->ID, uint64_t(resource), uint64_t(currentContext)
+		);
 
 		registeredResources[source->ID] = registration;
 	}else if(registeredResources[source->ID].texture.version != version){
@@ -1831,6 +1842,7 @@ CudaGlMappings SplatEditor::mapCudaGl(shared_ptr<GLTexture> source){
 		RegisteredTexture registration;
 		registration.texture = *source;
 		registration.resource = resource;
+		registration.cudaContext = currentContext;
 
 		// println("    registered source->handle: {}, source->ID: {}, resource: {}", source->handle, source->ID, uint64_t(resource));
 
@@ -1838,6 +1850,14 @@ CudaGlMappings SplatEditor::mapCudaGl(shared_ptr<GLTexture> source){
 	}
 
 	CUgraphicsResource resource = registeredResources[source->ID].resource;
+	// println(
+	// 	"mapCudaGl map: textureID={}, glHandle={}, resource={}, registeredCudaContext={}, currentCudaContext={}",
+	// 	source->ID,
+	// 	source->handle,
+	// 	uint64_t(resource),
+	// 	uint64_t(registeredResources[source->ID].cudaContext),
+	// 	uint64_t(currentContext)
+	// );
 
 	std::vector< CUgraphicsResource> resources = {resource};
 	CURuntime::check(cuGraphicsMapResources(resources.size(), resources.data(), ((CUstream)CU_STREAM_DEFAULT)));

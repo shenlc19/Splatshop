@@ -719,6 +719,12 @@ void SplatEditor::makeToolbar(){
 			}
 
 			ImGui::SameLine();
+			if(ImGui::Button("Dump FB")){
+				editor->settings.requestFramebufferDump = true;
+				GLRenderer::requestFramebufferDump = true;
+			}
+
+			ImGui::SameLine();
 			ImGui::Checkbox("SoA", &editor->settings.renderSoA);
 			ImGui::SameLine();
 			ImGui::Checkbox("Bandwidth", &editor->settings.renderBandwidth);

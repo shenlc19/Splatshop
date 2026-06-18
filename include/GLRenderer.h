@@ -271,6 +271,7 @@ struct GLRenderer{
 	inline static int width = 0;
 	inline static int height = 0;
 	inline static string selectedMethod = "";
+	inline static bool requestFramebufferDump = false;
 
 	static void init();
 

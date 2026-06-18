@@ -1,14 +1,62 @@
 
+#include <cstring>
 #include <filesystem>
 #include <print>
 
 #include "GLRenderer.h"
+#include "ImageLoader.h"
 #include "Runtime.h"
 
 namespace fs = std::filesystem;
 
 using std::print;
 
+
+static void dumpOpenGLFramebuffer(shared_ptr<Framebuffer> framebuffer, string outputDirectory = "./debug") {
+
+	if(!framebuffer || framebuffer->colorAttachments.empty()){
+		println("OpenGL framebuffer dump skipped: invalid framebuffer.");
+		return;
+	}
+
+	int width = framebuffer->width;
+	int height = framebuffer->height;
+
+	if(width <= 0 || height <= 0){
+		println("OpenGL framebuffer dump skipped: invalid size.");
+		return;
+	}
+
+	fs::create_directories(outputDirectory);
+
+	vector<uint8_t> pixels(width * height * 4);
+	vector<uint8_t> flipped(width * height * 4);
+
+	auto colorAttachment = framebuffer->colorAttachments[0];
+	glFinish();
+	glGetTextureImage(
+		colorAttachment->handle,
+		0,
+		GL_RGBA,
+		GL_UNSIGNED_BYTE,
+		GLsizei(pixels.size()),
+		pixels.data()
+	);
+
+	for(int y = 0; y < height; y++){
+		memcpy(
+			flipped.data() + int64_t(height - 1 - y) * width * 4,
+			pixels.data() + int64_t(y) * width * 4,
+			width * 4
+		);
+	}
+
+	static uint64_t dumpID = 0;
+	string path = format("{}/framebuffer_gl_{:04}_color.png", outputDirectory, dumpID++);
+	stbi_write_png(path.c_str(), width, height, 4, flipped.data(), width * 4);
+
+	println("OpenGL framebuffer dump saved: {}", path);
+}
 
 static void APIENTRY debugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam) {
 
@@ -321,6 +369,11 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 		// ImGuizmo::BeginFrame();
 
 		render();
+
+		if(GLRenderer::requestFramebufferDump){
+			dumpOpenGLFramebuffer(view.framebuffer);
+			GLRenderer::requestFramebufferDump = false;
+		}
 
 		Runtime::frame_keys.clear();
 		Runtime::frame_scancodes.clear();

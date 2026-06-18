@@ -39,7 +39,7 @@ void initCuda(){
 	println("granularity_recommended: {:L}", granularity_recommended);
 }
 
-void initScene() {
+void initScene(string path) {
 
 	Runtime::controls->yaw    = -1.325;
 	Runtime::controls->pitch  = -0.330;
@@ -51,7 +51,6 @@ void initScene() {
 
 	// string path = "./gaussians_w_pca.ply";
 	// string path = "./splatmodels_benchmark_garden_far/scene.json";
-	string path = "./splatmodels/scene.json";
 	// string path = "E:/resources/gaussian_splats/garden.ply";
 	// string path = "E:/resources/splats/gardentable.ply";
 	// string path = "./splatmodels_3dgs_and_perspcorrect/scene.json";
@@ -238,7 +237,7 @@ void initScene() {
 
 }
 
-int main(){
+int main(int argc, char** argv){
 
 	initCuda();
 
@@ -302,7 +301,12 @@ int main(){
 	// GPUPrefixSums::init();
 	// GPUSorting::initSorting();
 
-	initScene();
+	string scenePath = "models/counter/point_cloud/iteration_30000/point_cloud.ply";
+	if(argc >= 2){
+		scenePath = argv[1];
+	}
+
+	initScene(scenePath);
 
 	glfwSetDropCallback(GLRenderer::window, [](GLFWwindow* window, int count, const char** paths){
 		

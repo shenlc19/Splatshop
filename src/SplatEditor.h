@@ -209,6 +209,7 @@ struct SplatEditor{
 		bool disableFrustumCulling       = false;
 		bool cullSmallSplats             = true;
 		bool requestDebugDump            = false;
+		bool requestFramebufferDump      = false;
 		bool enableOverlapped            = true;
 		int splatRenderer                = SPLATRENDERER_3DGS;
 		int intersectionMode             = INTERSECTION_APPROXIMATE;
