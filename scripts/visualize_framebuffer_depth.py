@@ -52,31 +52,61 @@ def resolve_paths(prefix_or_depth: Path, camera_path: Optional[Path], color_path
     return prefix, depth_path, camera_path, color_path, mask_path
 
 
-def depth_to_points(depth: np.ndarray, camera: dict, *, stride: int, camera_space: bool) -> tuple[np.ndarray, np.ndarray]:
+def depth_to_point_map(depth: np.ndarray, camera: dict, *, camera_space: bool) -> tuple[np.ndarray, np.ndarray]:
     height, width = depth.shape
     projection = np.asarray(camera["projectionMatrix"], dtype=np.float64)
     proj00 = float(projection[0, 0])
     proj11 = float(projection[1, 1])
 
-    x, y = np.meshgrid(np.arange(0, width, stride, dtype=np.float64), np.arange(0, height, stride, dtype=np.float64))
+    x, y = np.meshgrid(np.arange(width, dtype=np.float64), np.arange(height, dtype=np.float64))
     ndc_x = (2.0 * (x + 0.5) / width) - 1.0
     ndc_y = 1.0 - (2.0 * (y + 0.5) / height)
 
-    z = depth[::stride, ::stride].astype(np.float64)
+    z = depth.astype(np.float64)
     valid = np.isfinite(z) & (z > 0.0)
 
-    points = np.empty((z.shape[0], z.shape[1], 3), dtype=np.float64)
-    points[..., 0] = ndc_x * z / proj00
-    points[..., 1] = ndc_y * z / proj11
-    points[..., 2] = -z
+    point_map = np.empty((height, width, 3), dtype=np.float64)
+    point_map[..., 0] = ndc_x * z / proj00
+    point_map[..., 1] = ndc_y * z / proj11
+    point_map[..., 2] = -z
+    point_map[~valid] = np.nan
 
-    points = points[valid]
     if not camera_space:
         camera_world = np.asarray(camera["cameraWorldMatrix"], dtype=np.float64)
-        homogeneous = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float64)], axis=1)
-        points = (camera_world @ homogeneous.T).T[:, :3]
+        valid_points = point_map[valid]
+        homogeneous = np.concatenate([valid_points, np.ones((valid_points.shape[0], 1), dtype=np.float64)], axis=1)
+        point_map[valid] = (camera_world @ homogeneous.T).T[:, :3]
 
-    return points, valid
+    return point_map, valid
+
+
+def point_map_to_points(point_map: np.ndarray, valid: np.ndarray, *, stride: int) -> tuple[np.ndarray, np.ndarray]:
+    sampled_points = point_map[::stride, ::stride]
+    sampled_valid = valid[::stride, ::stride]
+    return sampled_points[sampled_valid], sampled_valid
+
+
+def write_pfm(path: Path, image: np.ndarray):
+    if image.ndim not in {2, 3} or (image.ndim == 3 and image.shape[2] != 3):
+        raise ValueError("PFM output must be HxW or HxWx3")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = "PF" if image.ndim == 3 else "Pf"
+    image = np.asarray(image, dtype="<f4")
+    height, width = image.shape[:2]
+
+    with path.open("wb") as file:
+        file.write(f"{header}\n{width} {height}\n-1.0\n".encode("ascii"))
+        image.tofile(file)
+
+
+def write_point_map(path: Path, point_map: np.ndarray):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".pfm":
+        write_pfm(path, point_map)
+    else:
+        with path.open("wb") as file:
+            np.save(file, point_map.astype(np.float32))
 
 
 def write_ply(path: Path, points: np.ndarray, colors: Optional[np.ndarray]):
@@ -137,6 +167,8 @@ def main():
     parser.add_argument("--color", type=Path, help="Path to *_color.png")
     parser.add_argument("--mask", type=Path, help="Path to *_transparent_mask.pfm")
     parser.add_argument("--output", "-o", type=Path, help="Output PLY path")
+    parser.add_argument("--point-map-output", type=Path, help="Output HxWx3 point map path (.npy by default, or .pfm)")
+    parser.add_argument("--no-point-map", action="store_true", help="Only write the PLY, not the image-aligned point map")
     parser.add_argument("--stride", type=int, default=1, help="Use every Nth pixel")
     parser.add_argument("--max-transparent", type=float, default=0.98, help="Reject pixels above this transparent-mask value")
     parser.add_argument("--camera-space", action="store_true", help="Leave points in camera coordinates instead of world coordinates")
@@ -148,29 +180,36 @@ def main():
 
     prefix, depth_path, camera_path, color_path, mask_path = resolve_paths(args.dump, args.camera, args.color, args.mask)
     output_path = args.output or prefix.with_name(prefix.name + "_depth_points.ply")
+    point_map_output_path = args.point_map_output or prefix.with_name(prefix.name + "_depth_point_map.npy")
 
     with camera_path.open("r", encoding="utf-8") as file:
         camera = json.load(file)
 
     depth = read_pfm(depth_path)
-    breakpoint()
-    points, valid = depth_to_points(depth, camera, stride=args.stride, camera_space=args.camera_space)
+    point_map, valid = depth_to_point_map(depth, camera, camera_space=args.camera_space)
+
+    if mask_path.exists():
+        mask = read_pfm(mask_path)
+        if mask.shape != depth.shape:
+            raise ValueError(f"Mask shape {mask.shape} does not match depth shape {depth.shape}")
+        keep_pixels = mask <= args.max_transparent
+        valid = valid & keep_pixels
+        point_map[~valid] = np.nan
+
+    if not args.no_point_map:
+        write_point_map(point_map_output_path, point_map)
+        print(f"Wrote point map {point_map.shape[1]}x{point_map.shape[0]}x3 to {point_map_output_path}")
+
+    points, sampled_valid = point_map_to_points(point_map, valid, stride=args.stride)
 
     color_values = None
     if color_path.exists():
         color = read_image(color_path)
+        if color.shape[:2] != depth.shape:
+            raise ValueError(f"Color shape {color.shape[:2]} does not match depth shape {depth.shape}")
         if args.stride > 1:
             color = color[::args.stride, ::args.stride]
-        color_values = color[valid]
-
-    if mask_path.exists():
-        mask = read_pfm(mask_path)
-        if args.stride > 1:
-            mask = mask[::args.stride, ::args.stride]
-        keep = mask[valid] <= args.max_transparent
-        points = points[keep]
-        if color_values is not None:
-            color_values = color_values[keep]
+        color_values = color[sampled_valid]
 
     write_ply(output_path, points, color_values)
     print(f"Wrote {len(points):,} points to {output_path}")
