@@ -59,6 +59,17 @@ struct GSPlyLoader{
 		return 0;
 	}
 
+	static int plyScalarTypeSize(const string& type){
+		if(type == "char" || type == "uchar" || type == "int8" || type == "uint8") return 1;
+		if(type == "short" || type == "ushort" || type == "int16" || type == "uint16") return 2;
+		if(type == "int" || type == "uint" || type == "int32" || type == "uint32") return 4;
+		if(type == "float" || type == "float32") return 4;
+		if(type == "double" || type == "float64") return 8;
+
+		cout << format("type not implemented: {} \n", type);
+		exit(123);
+	}
+
 	static GSPlyHeader readHeader(string path){
 
 		int64_t numSplats = 0;
@@ -83,6 +94,7 @@ struct GSPlyLoader{
 		int64_t OFFSETS_OPACITY    = 0;
 		int64_t OFFSETS_DC         = 0;
 		int64_t OFFSETS_SHs        = 0;
+		bool parsingVertexElement  = false;
 
 		for(string line : lines){
 
@@ -91,9 +103,12 @@ struct GSPlyLoader{
 
 			vector<string> tokens = split(line, ' ');
 
-			if(tokens[0] == "element" && tokens[1] == "vertex"){
-				numSplats = std::stoi(tokens[2]);
-			}else if(tokens[0] == "property"){
+			if(tokens.size() >= 3 && tokens[0] == "element"){
+				parsingVertexElement = tokens[1] == "vertex";
+				if(parsingVertexElement){
+					numSplats = std::stoi(tokens[2]);
+				}
+			}else if(tokens.size() >= 3 && tokens[0] == "property" && parsingVertexElement){
 				string type = tokens[1];
 				string name = tokens[2];
 
@@ -120,14 +135,7 @@ struct GSPlyLoader{
 					numSHCoefficients++;
 				}
 
-				if(tokens[1] == "float"){
-					byteOffset += 4;
-				}else{
-					cout << format("type not implemented: {} \n", type);
-					exit(123);
-				}
-
-
+				byteOffset += plyScalarTypeSize(type);
 				numAttributesProcessed++;
 			}
 		}

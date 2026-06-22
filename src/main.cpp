@@ -10,7 +10,10 @@
 #include "Runtime.h"
 #include "CURuntime.h"
 #include "ImageLoader.h"
+#include "RuntimeDllSearchPath.h"
 #include "SplatEditor.h"
+
+#include <onnxruntime_cxx_api.h>
 
 using namespace std;
 
@@ -238,6 +241,9 @@ void initScene(string path) {
 }
 
 int main(int argc, char** argv){
+
+	configureRuntimeDllSearchPath();
+	Ort::InitApi();
 
 	initCuda();
 

@@ -7,10 +7,10 @@
 
 #include "ImageLoader.h"
 #include "inpaint/LamaInpaint.h"
-// Temporarily disabled while maintaining only the Lama inpaint module.
-// #include "moge/MogeGsPredictor.h"
-#include "moge_gs_export.h"
+#include "infinidepth/InfiniDepthGsPredictor.h"
 #include "json/json.hpp"
+#include "loader/GSPlyLoader.h"
+#include "scene/SNSplats.h"
 
 static nlohmann::json dump_render_target_matrix_json(const glm::mat4& matrix){
 	nlohmann::json rows = nlohmann::json::array();
@@ -22,6 +22,41 @@ static nlohmann::json dump_render_target_matrix_json(const glm::mat4& matrix){
 		rows.push_back(values);
 	}
 	return rows;
+}
+
+static bool dump_render_target_env_bool(const char* name, bool fallback){
+	const char* value = std::getenv(name);
+	if(!value || value[0] == '\0'){
+		return fallback;
+	}
+	string text = value;
+	return text == "1" || text == "true" || text == "TRUE" || text == "on" || text == "ON";
+}
+
+static void dump_render_target_load_predicted_ply(const string& plyPath){
+	if(!dump_render_target_env_bool("SPLATSHOP_INFINIDEPTH_AUTO_LOAD_PLY", true)){
+		println("InfiniDepth predicted PLY auto-load disabled: {}", plyPath);
+		return;
+	}
+	if(!std::filesystem::exists(plyPath)){
+		println("InfiniDepth predicted PLY auto-load skipped, file missing: {}", plyPath);
+		return;
+	}
+	if(SplatEditor::instance == nullptr){
+		println("InfiniDepth predicted PLY auto-load skipped, editor instance unavailable: {}", plyPath);
+		return;
+	}
+
+	try{
+		auto splats = GSPlyLoader::load(plyPath);
+		shared_ptr<SNSplats> node = make_shared<SNSplats>(splats->name, splats);
+		node->name = std::filesystem::path(plyPath).stem().string();
+		SplatEditor::instance->scene.world->children.push_back(node);
+		SplatEditor::instance->setSelectedNode(node.get());
+		println("InfiniDepth predicted PLY loaded to canvas: {}", plyPath);
+	}catch(const std::exception& e){
+		println("InfiniDepth predicted PLY auto-load failed: {}", e.what());
+	}
 }
 
 static void dump_render_target_framebuffer(RenderTarget& target, string outputDirectory = "./debug"){
@@ -97,7 +132,7 @@ static void dump_render_target_framebuffer(RenderTarget& target, string outputDi
 	string opacityFloatPath = basename + "_transparent_mask.pfm";
 	string depthPath = basename + "_depth.pfm";
 	string inpaintedPath = basename + "_inpainted.png";
-	string mogePlyPath = basename + "_moge_gs.ply";
+	string infinidepthPlyPath = basename + "_infinidepth_gs.ply";
 	string infoPath = basename + "_info.txt";
 	string cameraPath = basename + "_camera.json";
 
@@ -160,70 +195,36 @@ static void dump_render_target_framebuffer(RenderTarget& target, string outputDi
 
 	LamaInpaintTimings inpaintTimings;
 	int inpaintExitCode = LamaInpaint::inpaintFramebuffer(colorPath, opacityPath, inpaintedPath, &inpaintTimings);
-	moge_gs::ExportResult mogeResult;
-	int mogeExitCode = -2;
-	string mogeInputPath = inpaintedPath;
+	InfiniDepthGsTimings infinidepthTimings;
+	int infinidepthExitCode = -2;
+	string infinidepthInputPath = inpaintedPath;
 
 	if (inpaintExitCode == 0 && std::filesystem::exists(inpaintedPath)) {
-		CUcontext beforeMogeCudaContext = nullptr;
-		CURuntime::check(cuCtxGetCurrent(&beforeMogeCudaContext));
-		println("MoGe CUDA context before export: {}", uint64_t(beforeMogeCudaContext));
+		CUcontext beforeInfiniDepthCudaContext = nullptr;
+		CURuntime::check(cuCtxGetCurrent(&beforeInfiniDepthCudaContext));
+		println("InfiniDepth CUDA context before export: {}", uint64_t(beforeInfiniDepthCudaContext));
 
-		moge_gs::ExportConfig mogeConfig;
-		mogeConfig.mogeModelPath = std::getenv("SPLATSHOP_MOGE_CORE_MODEL")
-			? std::getenv("SPLATSHOP_MOGE_CORE_MODEL")
-			: R"(E:\projects\MoGe\workspace\moge_v1_forward_houseindoor_768_with_features_dynamic_query.onnx)";
-		mogeConfig.gsModelPath = std::getenv("SPLATSHOP_MOGE_GS_MODEL")
-			? std::getenv("SPLATSHOP_MOGE_GS_MODEL")
-			: R"(E:\projects\MoGe\workspace\gs_predictor_houseindoor_768_tokens1734.onnx)";
-		mogeConfig.imagePath = mogeInputPath;
-		mogeConfig.outputPlyPath = mogePlyPath;
-		mogeConfig.cudaDeviceId = std::getenv("SPLATSHOP_MOGE_CUDA_DEVICE")
-			? std::stoi(std::getenv("SPLATSHOP_MOGE_CUDA_DEVICE"))
-			: 0;
-		mogeConfig.resizeTo = std::getenv("SPLATSHOP_MOGE_RESIZE_TO")
-			? std::stoi(std::getenv("SPLATSHOP_MOGE_RESIZE_TO"))
-			: 768;
-		mogeConfig.warmup = 0;
-		mogeConfig.repeat = 1;
+		infinidepthExitCode = InfiniDepthGsPredictor::predictToPly(
+			infinidepthInputPath,
+			depthPath,
+			cameraPath,
+			infinidepthPlyPath,
+			&infinidepthTimings
+		);
 
-		println("MoGe config:");
-		println("  mogeModelPath: {}", mogeConfig.mogeModelPath);
-		println("  gsModelPath: {}", mogeConfig.gsModelPath);
-		println("  imagePath: {}", mogeConfig.imagePath);
-		println("  outputPlyPath: {}", mogeConfig.outputPlyPath);
-		println("  resizeTo: {}", mogeConfig.resizeTo);
-		println("  cudaDeviceId: {}", mogeConfig.cudaDeviceId);
+		CUcontext afterInfiniDepthCudaContext = nullptr;
+		CURuntime::check(cuCtxGetCurrent(&afterInfiniDepthCudaContext));
+		println("InfiniDepth CUDA context after export: {}", uint64_t(afterInfiniDepthCudaContext));
 
-		mogeResult = moge_gs::export_to_ply(mogeConfig);
-		mogeExitCode = mogeResult.exitCode;
-		CUcontext afterMogeCudaContext = nullptr;
-		CURuntime::check(cuCtxGetCurrent(&afterMogeCudaContext));
-		println("MoGe CUDA context after export: {}", uint64_t(afterMogeCudaContext));
-
-		if (mogeExitCode == 0) {
-			println("MoGe GS prediction saved: {}", mogePlyPath);
+		if (infinidepthExitCode == 0) {
+			println("InfiniDepth GS prediction saved: {}", infinidepthPlyPath);
+			dump_render_target_load_predicted_ply(infinidepthPlyPath);
 		} else {
-			println("MoGe GS prediction failed: {}", mogeResult.message);
+			println("InfiniDepth GS prediction failed.");
 		}
 	} else {
-		println("MoGe GS prediction skipped: inpainted image unavailable.");
+		println("InfiniDepth GS prediction skipped: inpainted image unavailable.");
 	}
-	// Temporarily disabled while maintaining only the Lama inpaint module.
-	// MogeGsPredictorTimings mogeTimings;
-	// int mogeExitCode = -2;
-	// string mogeInputPath = inpaintedPath;
-	// if(inpaintExitCode == 0 && std::filesystem::exists(mogeInputPath)){
-	// 	CUcontext splatshopCudaContext = nullptr;
-	// 	CURuntime::check(cuCtxGetCurrent(&splatshopCudaContext));
-	// 	mogeExitCode = MogeGsPredictor::predictToPly(mogeInputPath, mogePlyPath, &mogeTimings);
-	// 	if(splatshopCudaContext != nullptr){
-	// 		CURuntime::check(cuCtxSetCurrent(splatshopCudaContext));
-	// 		CURuntime::check(cuCtxSynchronize());
-	// 	}
-	// }else{
-	// 	println("MoGe GS prediction skipped: inpainted image unavailable.");
-	// }
 
 	if (splatshopCudaContext != nullptr) {
 		CURuntime::check(cuCtxSetCurrent(splatshopCudaContext));
@@ -232,25 +233,34 @@ static void dump_render_target_framebuffer(RenderTarget& target, string outputDi
 
 	CUcontext restoredCudaContext = nullptr;
 	CURuntime::check(cuCtxGetCurrent(&restoredCudaContext));
-	println("Framebuffer dump CUDA context before LaMa/MoGe: {}", uint64_t(splatshopCudaContext));
+	println("Framebuffer dump CUDA context before LaMa/InfiniDepth: {}", uint64_t(splatshopCudaContext));
 	println("Framebuffer dump CUDA context after restore: {}", uint64_t(restoredCudaContext));
 
 	string info = format(
 		"width: {}\nheight: {}\nsource: virt_framebuffer->cptr\nlayout: uint64 color_low32 depth_high32\nalpha: accumulated opacity\ntransparentMask: 1.0 - accumulated opacity\ndepthConvention: positive linear -view_z in the exported camera coordinate system\nfiniteDepthCount: {}\nminDepth: {}\nmaxDepth: {}\nminTransparentMask: {}\nmaxTransparentMask: {}\ncameraPath: {}\ninpaintedPath: {}\ninpaintExitCode: {}\nlamaTotalMs: {}\nlamaModelLoadMs: {}\nlamaModelLoadedThisCall: {}\nlamaInputLoadAndPreprocessMs: {}\nlamaInferenceMs: {}\nlamaResultSaveMs: {}\n"
-		"mogeInputPath: {}\nmogePlyPath: {}\nmogeExitCode: {}\nmogeTotalMs: {}\nmogeGaussianCount: {}",
+		"infinidepthInputPath: {}\ninfinidepthDepthPath: {}\ninfinidepthCameraPath: {}\ninfinidepthPlyPath: {}\ninfinidepthExitCode: {}\ninfinidepthTotalMs: {}\ninfinidepthModelLoadMs: {}\ninfinidepthModelsLoadedThisCall: {}\ninfinidepthCacheSessions: {}\ninfinidepthInputProcessingMs: {}\ninfinidepthDepthInferenceMs: {}\ninfinidepthGsInferenceAndExportMs: {}\ninfinidepthGaussianCount: {}\ninfinidepthRemovedCount: {}",
 		width, height, finiteDepthCount, minDepth, maxDepth, minOpacity, maxOpacity,
 		cameraPath, inpaintedPath, inpaintExitCode, inpaintTimings.totalMs, inpaintTimings.modelLoadMs,
 		inpaintTimings.modelLoadedThisCall, inpaintTimings.inputLoadAndPreprocessMs,
 		inpaintTimings.inferenceMs, inpaintTimings.resultSaveMs,
-		mogeInputPath,
-		mogePlyPath,
-		mogeExitCode,
-		mogeResult.timings.total_ms,
-		mogeResult.timings.gaussianCount
+		infinidepthInputPath,
+		depthPath,
+		cameraPath,
+		infinidepthPlyPath,
+		infinidepthExitCode,
+		infinidepthTimings.totalMs,
+		infinidepthTimings.modelLoadMs,
+		infinidepthTimings.modelsLoadedThisCall,
+		infinidepthTimings.cacheSessions,
+		infinidepthTimings.inputProcessingMs,
+		infinidepthTimings.depthInferenceMs,
+		infinidepthTimings.gsInferenceAndExportMs,
+		infinidepthTimings.gaussianCount,
+		infinidepthTimings.removedCount
 	);
 	writeFile(infoPath.c_str(), info);
 
-	println("Framebuffer dump saved: {}, {}, {}, {}, {}, {}, {}", colorPath, opacityPath, opacityFloatPath, depthPath, cameraPath, inpaintedPath, infoPath);
+	println("Framebuffer dump saved: {}, {}, {}, {}, {}, {}, {}, {}", colorPath, opacityPath, opacityFloatPath, depthPath, cameraPath, inpaintedPath, infinidepthPlyPath, infoPath);
 }
 
 void SplatEditor::render(){

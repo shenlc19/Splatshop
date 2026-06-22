@@ -22,8 +22,7 @@ file(GLOB SplatEditor_SOURCES CONFIGURE_DEPENDS
 	src/GPUSorting/*.*
 	src/gui/*.*
 	src/inpaint/*.*
-	# Temporarily disabled while maintaining only the Lama inpaint module.
-	# src/moge/*.*
+	src/infinidepth/*.*
 	src/render/*.*
 	src/scene/*.*
 	src/update/*.*
@@ -65,12 +64,34 @@ ADD_IMGUIZMO(${TARGET_NAME})
 target_include_directories(${TARGET_NAME} PRIVATE ./include)
 target_include_directories(${TARGET_NAME} PRIVATE ./libs)
 
-# Temporarily disabled while maintaining only the Lama inpaint module.
-# set(MOGE_GS_PIPELINE_SOURCE "E:/projects/MoGe/cpp/moge_gs_pipeline.cpp" CACHE FILEPATH "MoGe GS C++ pipeline source")
-# if(NOT EXISTS "${MOGE_GS_PIPELINE_SOURCE}")
-# 	message(WARNING "MoGe GS pipeline source not found: ${MOGE_GS_PIPELINE_SOURCE}")
-# endif()
-# target_compile_definitions(${TARGET_NAME} PRIVATE SPLATSHOP_MOGE_GS_PIPELINE_SOURCE="${MOGE_GS_PIPELINE_SOURCE}")
+set(INFINIDEPTH_CUDA_SOURCES
+	${CMAKE_CURRENT_SOURCE_DIR}/src/infinidepth/infinidepth_depthsensor_kernels.cu
+	${CMAKE_CURRENT_SOURCE_DIR}/src/infinidepth/infinidepth_gs_sparse.cu
+	${CMAKE_CURRENT_SOURCE_DIR}/src/infinidepth/infinidepth_input_processing_kernels.cu
+)
+get_filename_component(SPLATSHOP_CUDA_BIN_DIR "${CUDAToolkit_NVCC_EXECUTABLE}" DIRECTORY)
+get_filename_component(SPLATSHOP_CUDA_ROOT_DIR "${SPLATSHOP_CUDA_BIN_DIR}" DIRECTORY)
+set(SPLATSHOP_CUDA_INCLUDE_DIR "${SPLATSHOP_CUDA_ROOT_DIR}/include")
+set(INFINIDEPTH_CUDA_OBJECTS)
+foreach(INFINIDEPTH_CUDA_SOURCE ${INFINIDEPTH_CUDA_SOURCES})
+	get_filename_component(INFINIDEPTH_CUDA_NAME ${INFINIDEPTH_CUDA_SOURCE} NAME_WE)
+	set(INFINIDEPTH_CUDA_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/infinidepth_cuda/${INFINIDEPTH_CUDA_NAME}.obj)
+	add_custom_command(
+		OUTPUT ${INFINIDEPTH_CUDA_OBJECT}
+		COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/infinidepth_cuda
+		COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
+			-c ${INFINIDEPTH_CUDA_SOURCE}
+			-o ${INFINIDEPTH_CUDA_OBJECT}
+			-std=c++17
+			-Xcompiler=/MD
+			-I${CMAKE_CURRENT_SOURCE_DIR}/src/infinidepth
+			-I${SPLATSHOP_CUDA_INCLUDE_DIR}
+		DEPENDS ${INFINIDEPTH_CUDA_SOURCE}
+		VERBATIM
+	)
+	list(APPEND INFINIDEPTH_CUDA_OBJECTS ${INFINIDEPTH_CUDA_OBJECT})
+endforeach()
+target_sources(${TARGET_NAME} PRIVATE ${INFINIDEPTH_CUDA_OBJECTS})
 
 if(WIN32 AND NOT OpenCV_DIR AND EXISTS "E:/libs/opencv/build")
 	set(OpenCV_DIR "E:/libs/opencv/build" CACHE PATH "Path to OpenCV CMake config" FORCE)
@@ -90,13 +111,6 @@ if(WIN32 AND NOT ONNXRUNTIME_ROOT AND EXISTS "E:/libs/onnxruntime-win-x64-gpu-1.
 	set(ONNXRUNTIME_ROOT "E:/libs/onnxruntime-win-x64-gpu-1.23.2" CACHE PATH "Path to ONNX Runtime C/C++ SDK root" FORCE)
 endif()
 
-set(MOGE_CPP_DIR "E:/projects/MoGe/cpp" CACHE PATH "MoGe C++ export API include directory")
-set(MOGE_GS_EXPORT_LIB "E:/projects/MoGe/build/moge_gs_export.lib" CACHE FILEPATH "MoGe GS export static library")
-
-target_include_directories(${TARGET_NAME} PRIVATE "${MOGE_CPP_DIR}")
-
-target_link_libraries(${TARGET_NAME} "${MOGE_GS_EXPORT_LIB}")
-
 set(TORCH_CUDA_DLL_DIR "$ENV{TORCH_CUDA_DLL_DIR}" CACHE PATH "Path to PyTorch CUDA/cuDNN runtime DLL directory")
 if(WIN32 AND NOT TORCH_CUDA_DLL_DIR AND EXISTS "D:/miniconda/envs/moge/Lib/site-packages/torch/lib")
 	set(TORCH_CUDA_DLL_DIR "D:/miniconda/envs/moge/Lib/site-packages/torch/lib" CACHE PATH "Path to PyTorch CUDA/cuDNN runtime DLL directory" FORCE)
@@ -112,7 +126,14 @@ if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
 endif()
 
 target_include_directories(${TARGET_NAME} PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
+target_compile_definitions(${TARGET_NAME} PRIVATE ORT_API_MANUAL_INIT)
 target_link_libraries(${TARGET_NAME} ${OpenCV_LIBS} "${ONNXRUNTIME_LIBRARY}")
+
+if(WIN32)
+	target_link_libraries(${TARGET_NAME} windowscodecs ole32)
+	target_link_options(${TARGET_NAME} PRIVATE "/DELAYLOAD:onnxruntime.dll")
+	target_link_libraries(${TARGET_NAME} delayimp)
+endif()
 
 if(WIN32)
 	set_property(TARGET ${TARGET_NAME} PROPERTY VS_DEBUGGER_ENVIRONMENT
